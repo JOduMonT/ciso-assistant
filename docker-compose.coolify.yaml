@@ -191,6 +191,17 @@ services:
     environment:
       - PUBLIC_BACKEND_API_URL=http://backend:8000/api
       - PUBLIC_BACKEND_API_EXPOSED_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}/api
+      # ORIGIN is what makes login work, and without it every sign-in fails.
+      # SvelteKit rejects a POST whose Origin header does not match the origin it
+      # believes it is serving, with "Cross-site POST form submissions are
+      # forbidden". Deriving that origin from PROTOCOL_HEADER gets it wrong here:
+      # the proxy terminates TLS and forwards plain HTTP to caddy, so caddy sets
+      # x-forwarded-proto: http, while the browser sends Origin: https://...
+      # The mismatch rejects the login POST before it ever reaches the backend,
+      # which looks exactly like a rejected password. Confirmed live 2026-09-10:
+      # the identical request succeeded with Origin: http and failed with https.
+      # Stating the origin outright removes the dependency on proxy headers.
+      - ORIGIN=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - PROTOCOL_HEADER=x-forwarded-proto
       - HOST_HEADER=x-forwarded-host
     read_only: true
