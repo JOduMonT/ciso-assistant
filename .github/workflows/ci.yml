@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-standalone:
+    uses: JOduMonT/fleet-toolkit/.github/workflows/compose-lint.yml@v1
+    with:
+      compose-file: docker-compose.yaml
+      env-file: .env.example
+
+  lint-coolify:
+    uses: JOduMonT/fleet-toolkit/.github/workflows/compose-lint.yml@v1
+    with:
+      compose-file: docker-compose.coolify.yaml
+      env-file: .env.example
+
+  # The smoke test requires every container to be `running` after a hardcoded
+  # 15s settle. This stack gates frontend, huey and caddy behind a backend
+  # healthcheck with a 150s start_period, so whether it passes depends on
+  # `docker compose up -d` blocking until that condition is met. If this job
+  # fails on the first run, the fix is a settle-seconds input on the toolkit
+  # workflow, not a change here.
+  smoke-test:
+    uses: JOduMonT/fleet-toolkit/.github/workflows/compose-smoke-test.yml@v1
+    with:
+      compose-file: docker-compose.yaml
+      env-file: .env.example

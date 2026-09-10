@@ -1,0 +1,199 @@
+# Coolify variant. Deployed; the standalone file is not.
+#
+# Three deliberate differences from docker-compose.yaml, each one a rule this
+# fleet learned the hard way:
+#
+#   1. NO ports: block anywhere. Publishing a port binds it on the server's
+#      public IP in plaintext, bypassing Traefik, TLS and Cloudflare. Traefik
+#      reaches containers over the external `coolify` network instead.
+#   2. NO container_name:. Fixed names collide when Coolify runs several stacks
+#      on one host.
+#   3. caddy serves plain HTTP on :80 rather than `tls internal` on :8443.
+#      Traefik terminates TLS; a second TLS layer behind it breaks routing.
+#
+# caddy is the stack's single entry point on purpose: it path-routes /api/* to
+# the backend and everything else to the frontend, and Traefik maps one hostname
+# to one service. Point Coolify's domain at the `caddy` service.
+
+services:
+  backend:
+    image: ghcr.io/intuitem/ciso-assistant-community/backend:v4.0.1
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    networks: [coolify]
+    environment:
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set}
+      - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
+      - DJANGO_DEBUG=False
+      - AUTH_TOKEN_TTL=7200
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/tmp/.cache
+      - XDG_CONFIG_HOME=/tmp/.config
+      - XDG_DATA_HOME=/tmp/.local/share
+      - QDRANT_URL=http://qdrant:6333
+      - POSTGRES_NAME=${POSTGRES_NAME:?POSTGRES_NAME must be set}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER must be set}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - DB_HOST=db
+      - DB_PORT=5432
+    volumes:
+      - ciso_db:/code/db
+    user: "1001:1001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 400
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health/ || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 150s
+
+  huey:
+    image: ghcr.io/intuitem/ciso-assistant-community/backend:v4.0.1
+    restart: unless-stopped
+    networks: [coolify]
+    depends_on:
+      backend: {condition: service_healthy}
+      db: {condition: service_healthy}
+    environment:
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set}
+      - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
+      - DJANGO_DEBUG=False
+      - AUTH_TOKEN_TTL=7200
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/tmp/.cache
+      - XDG_CONFIG_HOME=/tmp/.config
+      - XDG_DATA_HOME=/tmp/.local/share
+      - QDRANT_URL=http://qdrant:6333
+      - POSTGRES_NAME=${POSTGRES_NAME:?POSTGRES_NAME must be set}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER must be set}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - DB_HOST=db
+      - DB_PORT=5432
+    entrypoint: ["/bin/sh", "-c", "python manage.py run_huey -w 2 --scheduler-interval 60"]
+    volumes:
+      - ciso_db:/code/db
+    user: "1001:1001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 200
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  frontend:
+    image: ghcr.io/intuitem/ciso-assistant-community/frontend:v4.0.1
+    restart: unless-stopped
+    networks: [coolify]
+    depends_on:
+      backend: {condition: service_healthy}
+      db: {condition: service_healthy}
+    environment:
+      - PUBLIC_BACKEND_API_URL=http://backend:8000/api
+      - PUBLIC_BACKEND_API_EXPOSED_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}/api
+      - PROTOCOL_HEADER=x-forwarded-proto
+      - HOST_HEADER=x-forwarded-host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 200
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.0
+    restart: unless-stopped
+    networks: [coolify]
+    volumes:
+      - ciso_qdrant:/qdrant/storage
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 200
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    networks: [coolify]
+    depends_on:
+      backend: {condition: service_healthy}
+      db: {condition: service_healthy}
+    volumes:
+      - ciso_caddy:/data/caddy
+    # Plain HTTP on :80. Traefik terminates TLS in front of this.
+    command: >
+      sh -c 'printf ":80 {\n
+      reverse_proxy /api/* backend:8000\n
+      reverse_proxy /* frontend:3000\n
+      }\n" > Caddyfile && caddy run'
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 100
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    networks: [coolify]
+    environment:
+      # The postgres image initialises from POSTGRES_DB; the Django backend reads
+      # the same database name from POSTGRES_NAME. Same value, two variable names.
+      - POSTGRES_DB=${POSTGRES_NAME:?POSTGRES_NAME must be set}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER must be set}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql and manages the
+      # version subdirectory itself. The older /var/lib/postgresql/data path
+      # crash-loops the container even against an empty volume.
+      - ciso_pgdata:/var/lib/postgresql
+    # Postgres drops privileges from root on start; bare cap_drop: ALL breaks
+    # that dance, and it writes in too many places for read_only.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 200
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  ciso_db:
+  ciso_pgdata:
+  ciso_qdrant:
+  ciso_caddy:
+
+networks:
+  coolify:
+    external: true

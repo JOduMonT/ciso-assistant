@@ -1,0 +1,12 @@
+name: Check upstream release
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  # Renovate's Dependency Dashboard only refreshes when Renovate actually runs,
+  # so this exists to force a re-scan instead of waiting for Monday.
+  workflow_dispatch:
+
+jobs:
+  check-release:
+    uses: JOduMonT/fleet-toolkit/.github/workflows/check-upstream-release.yml@v1
