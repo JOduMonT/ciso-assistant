@@ -29,40 +29,55 @@ jobs:
       compose-file: docker-compose.yaml
       env-file: .env.example
 
-  # Temporary. The toolkit smoke test tears the stack down on always(), so a
-  # backend that never reports healthy fails with no explanation of why. This
-  # brings the same stack up and prints the backend's own log and healthcheck
-  # output. Delete once the backend startup failure is understood.
-  diagnose-backend:
+  # The toolkit smoke test tears the stack down in an `if: always()` step, so
+  # when a container never becomes healthy its failure message carries no
+  # container log at all. That made a plain permissions error on the ciso_db
+  # volume look like a database outage and cost a full debugging cycle, so this
+  # job asserts the backend actually reaches `healthy` and prints its log when
+  # it does not. Remove once compose-smoke-test.yml dumps logs on failure.
+  backend-startup:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Start db, qdrant and backend only
+
+      - name: Bring up the backend and its dependencies
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose -f docker-compose.yaml up -d db qdrant backend
+
+      - name: Wait for the backend to report healthy
+        id: wait
         run: |
           set -uo pipefail
-          cp .env.example .env
-          docker compose -f docker-compose.yaml up -d --no-deps db qdrant backend
-          echo "waiting up to 240s for the backend to settle"
-          for i in $(seq 1 24); do
-            sleep 10
-            state=$(docker inspect --format '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}}' ciso-assistant-backend-1 2>/dev/null || echo gone)
+          for i in $(seq 1 40); do
+            state=$(docker inspect --format \
+              '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}}' \
+              ciso-assistant-backend-1 2>/dev/null || echo "gone:gone")
             echo "t=$((i*10))s $state"
-            [ "${state%%:*}" = "exited" ] && break
+            case "$state" in
+              running:healthy) echo "backend healthy after $((i*10))s"; exit 0 ;;
+              exited:*|gone:*)  echo "backend is $state, not waiting further"; exit 1 ;;
+            esac
+            sleep 10
           done
-      - name: Backend container log
-        if: always()
-        run: docker compose -f docker-compose.yaml logs --no-color backend 2>&1 | tail -100
-      - name: Backend healthcheck probe output
-        if: always()
+          echo "backend never reported healthy within 400s"
+          exit 1
+
+      - name: Backend log
+        if: failure()
+        run: docker compose -f docker-compose.yaml logs --no-color backend 2>&1 | tail -80
+
+      - name: Recorded healthcheck probes
+        if: failure()
         run: |
-          docker inspect --format '{{json .State.Health}}' ciso-assistant-backend-1 2>/dev/null \
-            | python3 -m json.tool 2>/dev/null | tail -40 || echo "no health state"
-      - name: Probe the health endpoint directly
-        if: always()
-        run: |
-          docker exec ciso-assistant-backend-1 \
-            curl -sS -o /dev/null -w 'health endpoint -> %{http_code}\n' \
-            http://localhost:8000/api/health/ 2>&1 || echo "exec/curl failed"
+          docker inspect --format '{{json .State.Health}}' ciso-assistant-backend-1 \
+            | python3 -m json.tool | tail -30 || echo "no health state"
+
+      - name: Ownership of the volume the backend must write to
+        if: failure()
+        run: docker exec ciso-assistant-backend-1 ls -ld /code/db || echo "exec failed"
+
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.yaml down -v
