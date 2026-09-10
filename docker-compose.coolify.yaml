@@ -23,7 +23,15 @@ services:
       db: {condition: service_healthy}
     networks: [coolify]
     environment:
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set}
+      # Django rejects any request whose Host header is absent from ALLOWED_HOSTS
+      # with 400 DisallowedHost when DEBUG=False. Two internal callers use a
+      # container name rather than the public hostname: the healthcheck below
+      # (Host: localhost) and the frontend's server-side calls to
+      # http://backend:8000/api (Host: backend). Both are appended here so the
+      # operator supplies only the public hostname and cannot get this wrong.
+      # Omitting them fails the deploy outright: the healthcheck never passes,
+      # so every `depends_on: service_healthy` on backend times out.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200
@@ -66,7 +74,8 @@ services:
       backend: {condition: service_healthy}
       db: {condition: service_healthy}
     environment:
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set}
+      # Same ALLOWED_HOSTS reasoning as the backend service above.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200

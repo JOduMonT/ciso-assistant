@@ -9,7 +9,12 @@ services:
     depends_on:
       db: {condition: service_healthy}
     environment:
-      - ALLOWED_HOSTS=backend,localhost
+      # The public hostname comes from ALLOWED_HOSTS; `backend` and `localhost`
+      # are appended because Django 400s any Host header absent from the list.
+      # The healthcheck below uses Host: localhost and the frontend's
+      # server-side calls use Host: backend, so both must be present or the
+      # backend never reports healthy and every dependent service times out.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200
@@ -51,7 +56,8 @@ services:
       backend: {condition: service_healthy}
       db: {condition: service_healthy}
     environment:
-      - ALLOWED_HOSTS=backend,localhost
+      # Same ALLOWED_HOSTS reasoning as the backend service above.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200
