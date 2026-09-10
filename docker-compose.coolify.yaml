@@ -70,14 +70,23 @@ services:
       db: {condition: service_healthy}
     networks: [coolify]
     environment:
-      # Django rejects any request whose Host header is absent from ALLOWED_HOSTS
-      # with 400 DisallowedHost when DEBUG=False. Two internal callers use a
+      # SET THE FULL LIST IN COOLIFY, not just the public hostname. Coolify
+      # supplies this variable from its own environment-variable store, and the
+      # `,backend,localhost` written here did NOT reach the container: a deploy
+      # with ALLOWED_HOSTS=<public hostname> alone put exactly
+      # ['<public hostname>'] into Django. The suffix is kept only so the
+      # standalone file and this one stay identical; do not rely on it here.
+      #
+      # Django rejects any request whose Host header is absent from the list
+      # with 400 DisallowedHost when DEBUG=False, and two internal callers use a
       # container name rather than the public hostname: the healthcheck below
       # (Host: localhost) and the frontend's server-side calls to
-      # http://backend:8000/api (Host: backend). Both are appended here so the
-      # operator supplies only the public hostname and cannot get this wrong.
-      # Omitting them fails the deploy outright: the healthcheck never passes,
-      # so every `depends_on: service_healthy` on backend times out.
+      # http://backend:8000/api (Host: backend).
+      #
+      # Getting this wrong fails the deploy without ever naming the cause. The
+      # healthcheck 400s on every probe, so it exhausts its budget and the error
+      # is `dependency failed to start: container backend is unhealthy` — which
+      # looks exactly like a slow or broken container. Confirmed live 2026-09-10.
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
@@ -108,18 +117,28 @@ services:
       options: {max-size: "10m", max-file: "3"}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health/ || exit 1"]
-      # Budget: start_period + interval*retries, and the deploy fails the moment
-      # it runs out, because everything else gates on this service being healthy.
-      # Upstream's 150s + 30*10s = 450s is tuned for their laptop compose on
-      # SQLite. A first boot here runs full Postgres migrations and
-      # `manage.py storelibraries` on a modest VPS, and overran 450s by seconds
-      # on the real server while taking 210s on a CI runner. Interval stays
-      # short because the proxy will not route this container until it reports
-      # healthy, so a slow interval leaves the app unreachable after every
-      # redeploy.
+      # Budget is start_period + interval*retries, and the deploy fails the
+      # moment it runs out because everything else gates on this service being
+      # healthy. Measured on the real server: 86s from Started to Healthy on a
+      # boot with the database already migrated, and roughly 210s on a CI runner
+      # doing a first boot, where migrations and `manage.py storelibraries` both
+      # run. start_period covers the slower first boot with room to spare, and
+      # costs nothing on a fast one — a probe that succeeds during start_period
+      # marks the container healthy immediately.
+      #
+      # Do not raise this to paper over a failing deploy. A healthcheck that can
+      # never pass exhausts exactly the same budget and fails at exactly the
+      # same moment as one that is merely slow, so a failure landing on the
+      # budget boundary proves nothing about which it is — read the container
+      # log instead. That mistake was made here on 2026-09-10, against what
+      # turned out to be a 400 DisallowedHost on every probe.
+      #
+      # Interval stays short: the proxy will not route a container that has a
+      # healthcheck until it reports healthy, so a slow interval leaves the app
+      # unreachable after every redeploy.
       interval: 10s
       timeout: 10s
-      retries: 60
+      retries: 30
       start_period: 300s
 
   huey:
@@ -172,6 +191,17 @@ services:
     environment:
       - PUBLIC_BACKEND_API_URL=http://backend:8000/api
       - PUBLIC_BACKEND_API_EXPOSED_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}/api
+      # ORIGIN is what makes login work, and without it every sign-in fails.
+      # SvelteKit rejects a POST whose Origin header does not match the origin it
+      # believes it is serving, with "Cross-site POST form submissions are
+      # forbidden". Deriving that origin from PROTOCOL_HEADER gets it wrong here:
+      # the proxy terminates TLS and forwards plain HTTP to caddy, so caddy sets
+      # x-forwarded-proto: http, while the browser sends Origin: https://...
+      # The mismatch rejects the login POST before it ever reaches the backend,
+      # which looks exactly like a rejected password. Confirmed live 2026-09-10:
+      # the identical request succeeded with Origin: http and failed with https.
+      # Stating the origin outright removes the dependency on proxy headers.
+      - ORIGIN=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - PROTOCOL_HEADER=x-forwarded-proto
       - HOST_HEADER=x-forwarded-host
     read_only: true
