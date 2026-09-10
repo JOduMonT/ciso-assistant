@@ -88,18 +88,28 @@ services:
       options: {max-size: "10m", max-file: "3"}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health/ || exit 1"]
-      # Budget: start_period + interval*retries, and the deploy fails the moment
-      # it runs out, because everything else gates on this service being healthy.
-      # Upstream's 150s + 30*10s = 450s is tuned for their laptop compose on
-      # SQLite. A first boot here runs full Postgres migrations and
-      # `manage.py storelibraries` on a modest VPS, and overran 450s by seconds
-      # on the real server while taking 210s on a CI runner. Interval stays
-      # short because the proxy will not route this container until it reports
-      # healthy, so a slow interval leaves the app unreachable after every
-      # redeploy.
+      # Budget is start_period + interval*retries, and the deploy fails the
+      # moment it runs out because everything else gates on this service being
+      # healthy. Measured on the real server: 86s from Started to Healthy on a
+      # boot with the database already migrated, and roughly 210s on a CI runner
+      # doing a first boot, where migrations and `manage.py storelibraries` both
+      # run. start_period covers the slower first boot with room to spare, and
+      # costs nothing on a fast one — a probe that succeeds during start_period
+      # marks the container healthy immediately.
+      #
+      # Do not raise this to paper over a failing deploy. A healthcheck that can
+      # never pass exhausts exactly the same budget and fails at exactly the
+      # same moment as one that is merely slow, so a failure landing on the
+      # budget boundary proves nothing about which it is — read the container
+      # log instead. That mistake was made here on 2026-09-10, against what
+      # turned out to be a 400 DisallowedHost on every probe.
+      #
+      # Interval stays short: the proxy will not route a container that has a
+      # healthcheck until it reports healthy, so a slow interval leaves the app
+      # unreachable after every redeploy.
       interval: 10s
       timeout: 10s
-      retries: 60
+      retries: 30
       start_period: 300s
 
   huey:
