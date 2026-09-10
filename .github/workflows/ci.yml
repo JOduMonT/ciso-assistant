@@ -94,6 +94,17 @@ jobs:
           docker compose -f docker-compose.yaml ps -a
           [ "$bad" = "0" ] || { docker compose -f docker-compose.yaml logs --no-color | tail -120; exit 1; }
 
+      # init-db-perms runs on every deploy, not just the first, and its fresh-volume
+      # path is the only one this job would otherwise exercise — `down -v` wipes the
+      # volume between runs. Re-running it against a volume it has already chowned is
+      # a different code path (root is no longer the owner, so chmod needs CAP_FOWNER)
+      # and it failed there in production while CI stayed green. Run it twice.
+      - name: Init container is idempotent across redeploys
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yaml up --force-recreate --exit-code-from init-db-perms init-db-perms
+          echo "init-db-perms succeeded a second time against an already-chowned volume"
+
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.yaml down -v

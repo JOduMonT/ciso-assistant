@@ -38,12 +38,13 @@ services:
   # The service exits 0 and stays exited; that is expected, not a crash.
   init-db-perms:
     image: busybox:1.37.0
-    # chmod BEFORE chown, and the order is load-bearing: chown hands the
-    # directory to 1001, after which root is no longer its owner and a chmod
-    # would need CAP_FOWNER, which is dropped here. Doing it while root still
-    # owns the directory needs no capability at all, so CHOWN stays the only
-    # one added. Getting this backwards exits 1 and blocks the whole stack.
-    command: ["sh", "-c", "set -e; chmod 700 /code/db; chown 1001:1001 /code/db; ls -ld /code/db"]
+    # This runs on EVERY deploy, so it has to be idempotent, and that is what
+    # decides the capabilities. On a fresh volume root owns /code/db and can
+    # chmod it as its owner. On every deploy after the first the directory
+    # already belongs to 1001, root is no longer the owner, and chmod then
+    # requires CAP_FOWNER. Without it this service works exactly once and exits
+    # 1 on every redeploy, taking the whole stack down with it — confirmed live.
+    command: ["sh", "-c", "set -e; chown 1001:1001 /code/db; chmod 700 /code/db; ls -ld /code/db"]
     user: "0:0"
     # It needs no network at all, but every service here declares one so Coolify
     # does not create a stray default network for this container alone.
@@ -52,7 +53,7 @@ services:
       - ciso_db:/code/db
     read_only: true
     cap_drop: [ALL]
-    cap_add: [CHOWN]
+    cap_add: [CHOWN, FOWNER]
     security_opt: [no-new-privileges:true]
     mem_limit: 64m
     pids_limit: 16
@@ -107,10 +108,19 @@ services:
       options: {max-size: "10m", max-file: "3"}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health/ || exit 1"]
+      # Budget: start_period + interval*retries, and the deploy fails the moment
+      # it runs out, because everything else gates on this service being healthy.
+      # Upstream's 150s + 30*10s = 450s is tuned for their laptop compose on
+      # SQLite. A first boot here runs full Postgres migrations and
+      # `manage.py storelibraries` on a modest VPS, and overran 450s by seconds
+      # on the real server while taking 210s on a CI runner. Interval stays
+      # short because the proxy will not route this container until it reports
+      # healthy, so a slow interval leaves the app unreachable after every
+      # redeploy.
       interval: 10s
       timeout: 10s
-      retries: 30
-      start_period: 150s
+      retries: 60
+      start_period: 300s
 
   huey:
     image: ghcr.io/intuitem/ciso-assistant-community/backend:v4.0.1
