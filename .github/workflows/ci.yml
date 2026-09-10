@@ -64,6 +64,14 @@ jobs:
           echo "backend never reported healthy within 400s"
           exit 1
 
+      # init-db-perms runs first and the stack cannot start without it, so its
+      # log comes first too. A failure here is reported by compose only as
+      # `service "init-db-perms" didn't complete successfully: exit 1`, which
+      # says nothing about which command failed.
+      - name: Init container log
+        if: failure()
+        run: docker compose -f docker-compose.yaml logs --no-color init-db-perms 2>&1 | tail -20
+
       - name: Backend log
         if: failure()
         run: docker compose -f docker-compose.yaml logs --no-color backend 2>&1 | tail -80

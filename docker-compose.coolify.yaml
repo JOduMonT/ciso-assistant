@@ -38,7 +38,12 @@ services:
   # The service exits 0 and stays exited; that is expected, not a crash.
   init-db-perms:
     image: busybox:1.37.0
-    command: ["sh", "-c", "chown 1001:1001 /code/db && chmod 700 /code/db"]
+    # chmod BEFORE chown, and the order is load-bearing: chown hands the
+    # directory to 1001, after which root is no longer its owner and a chmod
+    # would need CAP_FOWNER, which is dropped here. Doing it while root still
+    # owns the directory needs no capability at all, so CHOWN stays the only
+    # one added. Getting this backwards exits 1 and blocks the whole stack.
+    command: ["sh", "-c", "set -e; chmod 700 /code/db; chown 1001:1001 /code/db; ls -ld /code/db"]
     user: "0:0"
     # It needs no network at all, but every service here declares one so Coolify
     # does not create a stray default network for this container alone.
