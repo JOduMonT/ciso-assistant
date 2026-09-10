@@ -180,12 +180,17 @@ services:
       - ciso_caddy:/data/caddy
     environment:
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
+    # printf with explicit \n, not a folded block with real newlines: YAML's `>`
+    # collapses those into spaces, which put the whole Caddyfile on one line and
+    # made caddy crash-loop on `Unexpected '}' ... at Caddyfile:1`. The \n
+    # sequences survive folding as two characters and printf turns them into
+    # real newlines. %s takes the URL so the value is never word-split.
     command: >
-      sh -c 'echo $$CISO_ASSISTANT_URL "{
-      reverse_proxy /api/* backend:8000
-      reverse_proxy /* frontend:3000
-      tls internal
-      }" > Caddyfile && caddy run'
+      sh -c 'printf "%s {\n
+      reverse_proxy /api/* backend:8000\n
+      reverse_proxy /* frontend:3000\n
+      tls internal\n
+      }\n" "$$CISO_ASSISTANT_URL" > Caddyfile && caddy run'
     mem_limit: 256m
     cpus: 0.5
     pids_limit: 100
