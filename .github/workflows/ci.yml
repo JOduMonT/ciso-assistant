@@ -17,14 +17,83 @@ jobs:
       compose-file: docker-compose.coolify.yaml
       env-file: .env.example
 
-  # The smoke test requires every container to be `running` after a hardcoded
-  # 15s settle. This stack gates frontend, huey and caddy behind a backend
-  # healthcheck with a 150s start_period, so whether it passes depends on
-  # `docker compose up -d` blocking until that condition is met. If this job
-  # fails on the first run, the fix is a settle-seconds input on the toolkit
-  # workflow, not a change here.
-  smoke-test:
-    uses: JOduMonT/fleet-toolkit/.github/workflows/compose-smoke-test.yml@v1
-    with:
-      compose-file: docker-compose.yaml
-      env-file: .env.example
+  # The toolkit smoke test tears the stack down in an `if: always()` step, so
+  # when a container never becomes healthy its failure message carries no
+  # container log at all. That made a plain permissions error on the ciso_db
+  # volume look like a database outage and cost a full debugging cycle, so this
+  # job brings up the whole stack, asserts the backend reaches `healthy`, checks
+  # nothing crashed, and prints the container logs when
+  # it does not. Remove once compose-smoke-test.yml dumps logs on failure.
+  stack-startup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Bring up the whole stack
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose -f docker-compose.yaml up -d
+
+      - name: Wait for the backend to report healthy
+        id: wait
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 40); do
+            state=$(docker inspect --format \
+              '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}}' \
+              ciso-assistant-backend-1 2>/dev/null || echo "gone:gone")
+            echo "t=$((i*10))s $state"
+            case "$state" in
+              running:healthy) echo "backend healthy after $((i*10))s"; exit 0 ;;
+              exited:*|gone:*)  echo "backend is $state, not waiting further"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "backend never reported healthy within 400s"
+          exit 1
+
+      # init-db-perms runs first and the stack cannot start without it, so its
+      # log comes first too. A failure here is reported by compose only as
+      # `service "init-db-perms" didn't complete successfully: exit 1`, which
+      # says nothing about which command failed.
+      - name: Init container log
+        if: failure()
+        run: docker compose -f docker-compose.yaml logs --no-color init-db-perms 2>&1 | tail -20
+
+      - name: Backend log
+        if: failure()
+        run: docker compose -f docker-compose.yaml logs --no-color backend 2>&1 | tail -80
+
+      - name: Recorded healthcheck probes
+        if: failure()
+        run: |
+          docker inspect --format '{{json .State.Health}}' ciso-assistant-backend-1 \
+            | python3 -m json.tool | tail -30 || echo "no health state"
+
+      - name: Ownership of the volume the backend must write to
+        if: failure()
+        run: docker exec ciso-assistant-backend-1 ls -ld /code/db || echo "exec failed"
+
+      # What the toolkit smoke test did, minus its false positive: it greps
+      # `ps -a` for anything not `running`, which cannot tell a one-shot init
+      # container that correctly exited 0 from a container that crashed. Here an
+      # exited container passes only if its exit code is 0.
+      - name: Check no container crashed
+        run: |
+          set -euo pipefail
+          bad=0
+          while read -r name state code; do
+            case "$state" in
+              running|created) ;;
+              exited) [ "$code" = "0" ] || { echo "CRASHED: $name exited $code"; bad=1; } ;;
+              *)      echo "BAD STATE: $name is $state"; bad=1 ;;
+            esac
+          done < <(docker compose -f docker-compose.yaml ps -a \
+                     --format '{{.Name}} {{.State}} {{.ExitCode}}')
+          docker compose -f docker-compose.yaml ps -a
+          [ "$bad" = "0" ] || { docker compose -f docker-compose.yaml logs --no-color | tail -120; exit 1; }
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yaml down -v

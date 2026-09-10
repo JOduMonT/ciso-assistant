@@ -3,13 +3,61 @@
 # The Coolify variant is docker-compose.coolify.yaml and has no ports: block.
 
 services:
+  # Docker creates a named-volume mountpoint root:root 0755 when the path does
+  # not exist in the image, and upstream's .dockerignore excludes `db`, so it
+  # never does. backend and huey run as 1001:1001 and cannot write there.
+  #
+  # That is fatal, not cosmetic, and it fails in a thoroughly misleading way:
+  # settings.py touches /code/db/idp_oidc_private_key.pem at import time, so
+  # every `manage.py` call dies with PermissionError, and startup.sh's
+  # `while ! python manage.py showmigrations iam` loop reads that as the
+  # database being down and prints "database not ready; waiting" forever. The
+  # container stays `running`, gunicorn never binds :8000, and the healthcheck
+  # fails until the deploy gives up — which surfaces as
+  # "dependency failed to start: container backend is unhealthy" with no hint
+  # that permissions were ever involved.
+  #
+  # Four things need this directory writable: that OIDC key, startup.sh's
+  # generated db/django_secret_key, db/attachments (LOCAL_STORAGE_DIRECTORY,
+  # so every file upload), and db/huey.db for the worker.
+  #
+  # Taking ownership once, as root, before anything else starts is the fix.
+  # The service exits 0 and stays exited; that is expected, not a crash.
+  init-db-perms:
+    image: busybox:1.37.0
+    # chmod BEFORE chown, and the order is load-bearing: chown hands the
+    # directory to 1001, after which root is no longer its owner and a chmod
+    # would need CAP_FOWNER, which is dropped here. Doing it while root still
+    # owns the directory needs no capability at all, so CHOWN stays the only
+    # one added. Getting this backwards exits 1 and blocks the whole stack.
+    command: ["sh", "-c", "set -e; chmod 700 /code/db; chown 1001:1001 /code/db; ls -ld /code/db"]
+    user: "0:0"
+    volumes:
+      - ciso_db:/code/db
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 16
+    restart: "no"
+    logging:
+      driver: json-file
+      options: {max-size: "1m", max-file: "1"}
+
   backend:
     image: ghcr.io/intuitem/ciso-assistant-community/backend:v4.0.1
     restart: unless-stopped
     depends_on:
+      init-db-perms: {condition: service_completed_successfully}
       db: {condition: service_healthy}
     environment:
-      - ALLOWED_HOSTS=backend,localhost
+      # The public hostname comes from ALLOWED_HOSTS; `backend` and `localhost`
+      # are appended because Django 400s any Host header absent from the list.
+      # The healthcheck below uses Host: localhost and the frontend's
+      # server-side calls use Host: backend, so both must be present or the
+      # backend never reports healthy and every dependent service times out.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200
@@ -48,10 +96,12 @@ services:
     image: ghcr.io/intuitem/ciso-assistant-community/backend:v4.0.1
     restart: unless-stopped
     depends_on:
+      init-db-perms: {condition: service_completed_successfully}
       backend: {condition: service_healthy}
       db: {condition: service_healthy}
     environment:
-      - ALLOWED_HOSTS=backend,localhost
+      # Same ALLOWED_HOSTS reasoning as the backend service above.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS must be set},backend,localhost
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
       - DJANGO_DEBUG=False
       - AUTH_TOKEN_TTL=7200
@@ -130,12 +180,17 @@ services:
       - ciso_caddy:/data/caddy
     environment:
       - CISO_ASSISTANT_URL=${CISO_ASSISTANT_URL:?CISO_ASSISTANT_URL must be set}
+    # printf with explicit \n, not a folded block with real newlines: YAML's `>`
+    # collapses those into spaces, which put the whole Caddyfile on one line and
+    # made caddy crash-loop on `Unexpected '}' ... at Caddyfile:1`. The \n
+    # sequences survive folding as two characters and printf turns them into
+    # real newlines. %s takes the URL so the value is never word-split.
     command: >
-      sh -c 'echo $$CISO_ASSISTANT_URL "{
-      reverse_proxy /api/* backend:8000
-      reverse_proxy /* frontend:3000
-      tls internal
-      }" > Caddyfile && caddy run'
+      sh -c 'printf "%s {\n
+      reverse_proxy /api/* backend:8000\n
+      reverse_proxy /* frontend:3000\n
+      tls internal\n
+      }\n" "$$CISO_ASSISTANT_URL" > Caddyfile && caddy run'
     mem_limit: 256m
     cpus: 0.5
     pids_limit: 100
